@@ -1,0 +1,33 @@
+# Dependencies (Playwright is an OPTIONAL capability installed with --no-save)
+node_modules/
+
+# Environment / secrets — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test / coverage artifacts
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+
+# Local runtime data (the app stores state in ~/.coding-agent by default;
+# these patterns protect anyone who redirects it into the repo)
+data/
+local/
+*.db
+*.sqlite
+*.sqlite3
+
+# Screenshots captured during browser verification
+screenshots/
+*.png.tmp

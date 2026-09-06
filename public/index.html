@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Software Engineering Workstation</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body data-theme="system">
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">AI Software Engineering Workstation</span>
+    </div>
+    <div class="header-meta">
+      <span id="active-project" class="chip" title="Active project">No project</span>
+      <select id="mode-select" title="Agent mode">
+        <option value="auto">Mode: Auto</option>
+        <option value="ask">Ask</option>
+        <option value="code">Code</option>
+        <option value="debug">Debug</option>
+        <option value="test">Test</option>
+        <option value="review">Review</option>
+        <option value="autonomous">Autonomous</option>
+      </select>
+      <select id="safety-select" title="Safety mode — caps what the agent may do">
+        <option value="readonly">Safety: Read-only</option>
+        <option value="assist">Safety: Assist (propose)</option>
+        <option value="edit">Safety: Edit</option>
+        <option value="agent">Safety: Agent</option>
+        <option value="autonomous">Safety: Autonomous</option>
+      </select>
+      <span id="offline-chip" class="badge badge-local hidden" title="No cloud provider reachable or offline mode enabled — running LOCAL only">LOCAL / OFFLINE</span>
+      <span id="model-chip" class="chip chip-muted" title="Provider used by the last task">no model yet</span>
+      <span id="conn-state" class="chip chip-muted">●&nbsp;checking…</span>
+      <select id="theme-select" title="Theme">
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </div>
+  </header>
+
+  <a class="skip-link" href="#composer-input">Skip to composer</a>
+  <div class="app-body">
+    <aside class="sidebar-left">
+      <section>
+        <h3>Project</h3>
+        <div id="project-list" class="list"></div>
+        <button id="add-project-btn" class="btn btn-block">+ Open Folder</button>
+        <button id="analyze-btn" class="btn btn-block btn-subtle">🔍 Analyze Project</button>
+        <div id="project-map-summary" class="small muted map-summary"></div>
+      </section>
+      <section>
+        <h3>Files</h3>
+        <div id="file-tree" class="file-tree"><div class="muted small">Select a project…</div></div>
+      </section>
+      <section>
+        <h3>Tasks</h3>
+        <div id="task-list" class="list"></div>
+      </section>
+      <section>
+        <h3>Providers</h3>
+        <div id="provider-list" class="list"></div>
+        <div class="row">
+          <button id="add-provider-btn" class="btn btn-block">+ Add Provider</button>
+          <button id="refresh-local-btn" class="btn btn-block btn-subtle" title="Detect a local Ollama server and list its models">♻ Detect Local (Ollama)</button>
+        </div>
+      </section>
+      <section>
+        <h3>Agents</h3>
+        <div id="agents-list" class="list"><div class="muted small">…</div></div>
+      </section>
+      <section>
+        <h3>Skills</h3>
+        <div id="skills-list" class="list"><div class="muted small">No skills detected.</div></div>
+      </section>
+      <section>
+        <h3>Memory</h3>
+        <div id="memory-status" class="muted small"></div>
+        <button id="memory-clear-btn" class="btn btn-block btn-subtle">Clear Session Memory</button>
+      </section>
+    </aside>
+
+    <main class="center-area">
+      <nav class="tab-bar" id="tab-bar" role="tablist" aria-label="Workstation areas">
+        <button class="tab active" data-tab="chat">💬 Chat</button>
+        <button class="tab" data-tab="files">📁 Files</button>
+        <button class="tab" data-tab="diff">🔀 Diff &amp; Approvals<span id="approval-count" class="badge hidden">0</span></button>
+        <button class="tab" data-tab="tests">🧪 Tests</button>
+        <button class="tab" data-tab="git">🌿 Git</button>
+        <button class="tab" data-tab="browser">🌐 Browser</button>
+        <button class="tab" data-tab="terminal">⌨ Terminal</button>
+        <button class="tab" data-tab="settings">⚙ Settings</button>
+      </nav>
+
+      <section class="panel panel-chat active" data-panel="chat">
+        <div id="chat-log" class="chat-log">
+          <div class="empty-state">
+            Select or open a project, then describe a task below — e.g.
+            "run the tests and fix any failures". Pick a mode in the header:
+            Ask explains, Code implements, Debug fixes, Test runs tests,
+            Review audits, Autonomous runs the full workflow.
+          </div>
+        </div>
+        <div class="composer">
+          <textarea id="composer-input" placeholder="Describe a task… (Enter+Ctrl/Cmd to send)"></textarea>
+          <div class="composer-actions">
+            <div class="quick-actions">
+              <button class="chip-btn" data-quick="Analyze the project structure and summarize what this project is">Analyze Project</button>
+              <button class="chip-btn" data-quick="Run the test suite and report results">Run Tests</button>
+              <button class="chip-btn" data-quick="Find and fix any obvious bugs">Find Bugs</button>
+              <button class="chip-btn" data-quick="Review the recent changes for security and correctness issues">Review</button>
+            </div>
+            <button id="send-btn" class="btn btn-primary">Send</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" data-panel="files">
+        <div class="panel-toolbar">
+          <span id="file-viewer-path" class="muted small">No file selected — click a file in the tree</span>
+          <button id="file-save-btn" class="btn hidden">💾 Save (respects safety mode)</button>
+        </div>
+        <textarea id="file-viewer" class="file-viewer" spellcheck="false" placeholder="File contents appear here…"></textarea>
+      </section>
+
+      <section class="panel" data-panel="diff">
+        <div class="panel-toolbar">
+          <h2>Pending Approvals</h2>
+          <button id="diff-refresh-btn" class="btn">↻ Refresh</button>
+        </div>
+        <div id="pending-approvals" class="approvals-list"></div>
+        <div class="panel-toolbar"><h2>Decision History</h2></div>
+        <div id="approval-history" class="approvals-list"></div>
+      </section>
+
+      <section class="panel" data-panel="tests">
+        <div class="panel-toolbar">
+          <h2>Test Center</h2>
+          <button id="tests-run-btn" class="btn btn-primary">▶ Run Tests</button>
+        </div>
+        <div id="tests-detect" class="small muted"></div>
+        <div id="tests-result"></div>
+        <div class="panel-toolbar"><h2>Recent Runs</h2></div>
+        <div id="tests-history" class="small"></div>
+      </section>
+
+      <section class="panel" data-panel="git">
+        <div class="panel-toolbar">
+          <h2>Git</h2>
+          <button id="git-refresh-btn" class="btn">↻ Refresh</button>
+        </div>
+        <div id="git-status"></div>
+        <div class="panel-toolbar"><h2>Diff</h2>
+          <select id="git-diff-mode"><option value="unstaged">Unstaged</option><option value="staged">Staged</option></select>
+        </div>
+        <pre id="git-diff" class="diff-view muted small">—</pre>
+        <div class="panel-toolbar"><h2>Recent Commits</h2></div>
+        <div id="git-log" class="small"></div>
+      </section>
+
+      <section class="panel" data-panel="browser">
+        <div class="panel-toolbar">
+          <h2>Browser</h2>
+          <button id="browser-check-btn" class="btn">↻ Check Capability</button>
+        </div>
+        <div id="browser-status"></div>
+        <div class="panel-toolbar">
+          <input id="browser-url" type="text" placeholder="http://localhost:3300 — URL to open" />
+          <button id="browser-go-btn" class="btn btn-primary">Open</button>
+        </div>
+        <div id="browser-report" class="small"></div>
+        <img id="browser-screenshot" class="hidden" alt="page screenshot" />
+      </section>
+
+      <section class="panel" data-panel="terminal">
+        <div class="panel-toolbar">
+          <h2>Terminal (project root)</h2>
+          <span class="muted small">HIGH/CRITICAL-risk commands require approval</span>
+        </div>
+        <div class="panel-toolbar">
+          <input id="terminal-input" type="text" placeholder="e.g. node --version" />
+          <button id="terminal-run-btn" class="btn btn-primary">Run</button>
+        </div>
+        <pre id="terminal-output" class="terminal-output muted">—</pre>
+      </section>
+
+      <section class="panel" data-panel="settings">
+        <div class="panel-toolbar">
+          <h2>Settings</h2>
+          <button id="settings-save-btn" class="btn btn-primary">💾 Save Settings</button>
+          <button id="doctor-btn" class="btn">🩺 Run Doctor</button>
+        </div>
+        <div class="settings-grid">
+          <div class="settings-group">
+            <h3>AI / Model Routing</h3>
+            <label>Strategy
+              <select id="set-modelStrategy">
+                <option value="LOCAL_FIRST">LOCAL_FIRST — local models first</option>
+                <option value="FREE_CLOUD_FIRST">FREE_CLOUD_FIRST — free-tier cloud first</option>
+                <option value="BEST_AVAILABLE">BEST_AVAILABLE — configured priority</option>
+                <option value="CHEAPEST_AVAILABLE">CHEAPEST_AVAILABLE — cheapest first</option>
+                <option value="MANUAL">MANUAL — one chosen provider</option>
+              </select>
+            </label>
+            <label>Manual provider id (MANUAL strategy only)
+              <input id="set-manualProviderId" type="text" placeholder="e.g. gemini-1" />
+            </label>
+            <label class="check"><input id="set-offlineMode" type="checkbox" /> Offline mode — use LOCAL providers only</label>
+          </div>
+          <div class="settings-group">
+            <h3>Agents / Team</h3>
+            <label>Max agents per team run <input id="set-maxAgents" type="number" min="1" max="10" /></label>
+            <label>Max parallel agents <input id="set-maxParallel" type="number" min="1" max="10" /></label>
+            <label class="check"><input id="set-reviewerRequired" type="checkbox" /> Require a Review agent after team runs</label>
+          </div>
+          <div class="settings-group">
+            <h3>Autonomy &amp; Verification</h3>
+            <label class="check"><input id="set-checkpointBeforeAutonomous" type="checkbox" /> Checkpoint before autonomous work</label>
+            <label class="check"><input id="set-testBeforeComplete" type="checkbox" /> Run tests before declaring completion</label>
+            <label>Task token budget (blank = unlimited) <input id="set-taskTokenBudget" type="number" min="1" placeholder="unlimited" /></label>
+          </div>
+          <div class="settings-group">
+            <h3>Context</h3>
+            <label>Context budget (bytes) <input id="set-contextBudgetBytes" type="number" min="4096" max="524288" /></label>
+            <label>Relevance threshold (min score) <input id="set-relevanceThreshold" type="number" min="1" max="50" /></label>
+            <label>Tool result limit (chars) <input id="set-toolResultCharLimit" type="number" min="500" max="200000" /></label>
+            <label>Request payload cap (chars) <input id="set-maxPayloadChars" type="number" min="4000" max="500000" /></label>
+          </div>
+          <div class="settings-group">
+            <h3>Terminal &amp; Browser</h3>
+            <label>Terminal timeout (ms) <input id="set-terminalTimeoutMs" type="number" min="2000" max="300000" /></label>
+            <label>Terminal output limit (chars) <input id="set-terminalOutputLimit" type="number" min="1000" max="500000" /></label>
+            <label class="check"><input id="set-browserHeadless" type="checkbox" /> Headless browser</label>
+            <label>Browser timeout (ms) <input id="set-browserTimeoutMs" type="number" min="5000" max="120000" /></label>
+          </div>
+          <div class="settings-group">
+            <h3>Team &amp; Routing</h3>
+            <label>Reasoning preference
+              <select id="set-reasoningPreference">
+                <option value="balanced">Balanced</option>
+                <option value="quality">Quality (priority order)</option>
+                <option value="speed">Speed (measured latency)</option>
+              </select>
+            </label>
+            <label>Conflict policy
+              <select id="set-conflictPolicy">
+                <option value="flag">Flag conflicts for review</option>
+                <option value="block">Block result on conflicts</option>
+              </select>
+            </label>
+            <label>Bounded retry wait (ms) <input id="set-retryWaitMs" type="number" min="1000" max="60000" /></label>
+            <label>UI refresh interval (ms) <input id="set-uiRefreshIntervalMs" type="number" min="2000" max="60000" /></label>
+          </div>
+        </div>
+        <div id="doctor-report" class="small"></div>
+      </section>
+    </main>
+
+    <aside class="sidebar-right">
+      <h3>Agent Activity</h3>
+      <div id="activity-log" class="activity-log">
+        <div class="muted small">No active task.</div>
+      </div>
+      <h3>Pending Approvals</h3>
+      <div id="approval-mini" class="approval-mini muted small">None.</div>
+    </aside>
+  </div>
+
+  <script src="/panels.js"></script>
+  <script src="/app.js"></script>
+  <footer class="status-bar" id="status-bar" role="status" aria-label="Workstation status">
+    <span id="sb-project" title="Active project">—</span>
+    <span id="sb-git" title="Git state">git: —</span>
+    <span id="sb-tests" title="Last test run">tests: —</span>
+    <span id="sb-provider" title="Provider / model">provider: —</span>
+    <span id="sb-tokens" title="Tokens used by the last task">tokens: —</span>
+    <span id="sb-safety" title="Safety mode">safety: —</span>
+  </footer>
+</body>
+</html>

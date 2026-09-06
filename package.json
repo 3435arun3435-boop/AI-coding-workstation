@@ -1,0 +1,16 @@
+{
+  "name": "coding-agent-workstation",
+  "version": "2.0.0",
+  "description": "Local AI Software Engineering Workstation: project intelligence, agent modes, diff/approval safety system, autonomous debug loop, test and git intelligence, optional Playwright browser verification, provider routing with local-model support, memory, task center, and a web UI/CLI.",
+  "main": "server.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "cli": "node cli.js",
+    "test": "node --test"
+  },
+  "dependencies": {}
+}
