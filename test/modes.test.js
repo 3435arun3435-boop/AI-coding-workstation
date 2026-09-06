@@ -74,19 +74,30 @@ test('resolveMode falls back safely on unknown modes and honors auto', () => {
 });
 
 // ---------------------------------------------------------------------------
-test('agent loop in ask mode: only read-only tools are declared to the model', async () => {
+test('agent loop in ask mode: pure chat declares NO tools; inspection tasks keep read-only tools', async () => {
   const projectRoot = tmpDir('modes-ask-');
+
+  // (a) Pure chat intent ("Analyze this project and give me a report") — the
+  // output_parse_failed bug scenario: NO tool schemas may be sent at all.
+  let chatTools = null;
+  const router = mockRouter();
+  await runAgentTask({
+    task: 'Analyze this project and give me a report', projectRoot, router,
+    callFn: async (_e, { tools }) => { chatTools = tools; return { choices: [{ message: { content: 'Report.' } }] }; },
+    mode: 'ask',
+  });
+  assert.deepEqual(chatTools, [], 'chat intent must send zero tool schemas (PART A bug fix)');
+
+  // (b) Explicit inspection targets keep read-only tools available.
   let seenTools = null;
-  const mockCall = async (_entry, { tools }) => {
-    seenTools = tools.map((t) => t.function.name);
-    return { choices: [{ message: { role: 'assistant', content: 'Explained.' } }] };
-  };
-  const result = await runAgentTask({ task: 'explain the project', projectRoot, router: mockRouter(), callFn: mockCall, mode: 'ask' });
-  assert.equal(result.status, 'completed');
+  await runAgentTask({
+    task: 'inspect package.json and explain the scripts', projectRoot, router: mockRouter(),
+    callFn: async (_e, { tools }) => { seenTools = tools.map((t) => t.function.name); return { choices: [{ message: { content: 'Explained.' } }] }; },
+    mode: 'ask',
+  });
   assert.ok(seenTools.includes('read_file'));
   assert.ok(!seenTools.includes('write_file'), 'write_file must not be declared in ask mode');
   assert.ok(!seenTools.includes('run_command'), 'run_command must not be declared in ask mode');
-  assert.equal(result.mode, 'ask');
 });
 
 test('agent loop in ask mode: server-side enforcement blocks a mutating call even if the model insists', async () => {

@@ -35,7 +35,9 @@ const { makeOrderingFn } = require('./src/model-router');
 const { runDoctor } = require('./src/doctor');
 const { detectSandbox } = require('./src/sandbox');
 const agentsEngine = require('./src/agents');
+const { classifyIntent } = require('./src/intent');
 const { setDefaults: setIntelDefaults } = require('./src/project-intel');
+const apiRegistry = require('./src/api-registry');
 
 const MAX_FILE_BYTES = 512 * 1024;
 const { MODE_KEYS: AGENT_MODE_KEYS, resolveMode } = require('./src/modes');
@@ -50,6 +52,14 @@ const tasks = new TaskStore(DATA_DIR);
 const approvals = new ApprovalStore(DATA_DIR);
 const testHistory = new TestHistoryStore(DATA_DIR);
 const settings = new SettingsStore(DATA_DIR);
+
+// Crash recovery: tasks left 'running'/'debugging'/etc. by a previous server
+// process can never finish — mark them honestly instead of lying forever.
+for (const t of tasks.list(200)) {
+  if (['queued', 'running', 'waiting_approval', 'testing', 'debugging'].includes(t.status)) {
+    tasks.complete(t.id, { status: 'failed', summary: 'Interrupted by a server restart before completion.' });
+  }
+}
 const checkpoints = new CheckpointStore(DATA_DIR);
 const knowledge = new KnowledgeStore(DATA_DIR);
 
@@ -280,6 +290,48 @@ const routes = {
     } catch (e) {
       sendJSON(res, 500, { ok: false, error: friendlyError(e) });
     }
+  },
+
+  // Free API Hub + public-apis discovery (PART B).
+  'GET /api/apis': async (req, res, parsedUrl) => {
+    const snapshot = new Map(router.snapshot().map((x) => [x.id, x]));
+    const entries = apiRegistry.listRegistryApis().map((api) => {
+      // Live health for entries that have a matching configured provider.
+      const provider = config.listProviders().find((p) => p.id.startsWith(api.id) || (api.id === 'ollama' && p.type === 'ollama'));
+      const health = provider && snapshot.get(provider.id)
+        ? { configured: true, enabled: provider.enabled !== false, healthy: snapshot.get(provider.id).healthy, inCooldown: snapshot.get(provider.id).inCooldown, lastError: snapshot.get(provider.id).lastError, usage: snapshot.get(provider.id).usage }
+        : { configured: false, health: 'not-configured' };
+      return { ...api, health };
+    });
+    sendJSON(res, 200, { ok: true, apis: entries });
+  },
+
+  'GET /api/apis/discover': async (req, res, parsedUrl) => {
+    const results = apiRegistry.searchPublicApis({
+      q: parsedUrl.query.q,
+      category: parsedUrl.query.category,
+      capability: parsedUrl.query.capability,
+      authType: parsedUrl.query.authType,
+      pricingType: parsedUrl.query.pricingType,
+      httpsOnly: parsedUrl.query.https === '1',
+    });
+    sendJSON(res, 200, { ok: true, count: results.length, apis: results, note: 'Metadata only — discovered APIs are never activated without explicit user connection.' });
+  },
+
+  'GET /api/apis/recommend': async (req, res, parsedUrl) => {
+    if (!parsedUrl.query.capability) return sendJSON(res, 400, { ok: false, error: 'capability query parameter is required' });
+    sendJSON(res, 200, { ok: true, capability: parsedUrl.query.capability, recommendations: apiRegistry.recommendForCapability(parsedUrl.query.capability) });
+  },
+
+  // Multi-key pool management for a provider (masked output only).
+  'POST /api/providers/keys': async (req, res) => {
+    const body = await readBody(req);
+    if (!body.id || !Array.isArray(body.keys)) return sendJSON(res, 400, { ok: false, error: 'id and keys[] are required' });
+    const provider = config.listProviders().find((p) => p.id === body.id);
+    if (!provider) return sendJSON(res, 404, { ok: false, error: 'Provider not found' });
+    config.upsertProvider({ id: body.id, keys: body.keys.map(String) });
+    const updated = config.listProvidersMasked().find((p) => p.id === body.id);
+    sendJSON(res, 200, { ok: true, provider: updated });
   },
 
   // Knowledge base inspection.
@@ -715,6 +767,40 @@ const routes = {
         matchedSkills = null;
       }
 
+      // Intent routing (PART A): the smallest useful execution path.
+      // An explicit engineering mode stays a task; ask/review refine to
+      // plain chat when no inspection targets are named.
+      const intentInfo = classifyIntent(body.task);
+      const effectiveIntent = ['ask', 'review'].includes(modeKey) ? intentInfo.intent : 'task';
+
+      // Chat intent + active project → inject the SMALLEST useful context:
+      // a compact project map summary (no tools, no file dumps).
+      const chatAdvisories = [];
+      if (effectiveIntent === 'chat') {
+        try {
+          const map = analyzeProject(project.rootPath);
+          chatAdvisories.push({
+            role: 'system',
+            content:
+              'PROJECT CONTEXT (auto-generated from the currently open project — you MUST answer using this; do not ask the user for files):\n' +
+              JSON.stringify({
+                projectType: map.projectType,
+                primaryLanguage: map.primaryLanguage,
+                frameworks: map.frameworks,
+                packageManager: map.packageManager,
+                entrypoints: map.entrypoints,
+                scripts: map.scripts,
+                dependencies: map.dependencies.slice(0, 15),
+                testFramework: map.testFramework,
+                fileCount: map.fileCount,
+                fileTree: map.files.slice(0, 40),
+              }, null, 2),
+          });
+        } catch {
+          /* context injection is best-effort */
+        }
+      }
+
       // Agents engine (WHO): the smallest useful specialist for this task.
       let selectedAgent = null;
       try {
@@ -741,6 +827,8 @@ const routes = {
         retryPolicy: settings.get('maxProviderRetries') != null ? { passes: settings.get('maxProviderRetries') + 1, waitMs: settings.get('retryWaitMs') } : null,
         tokenBudget: settings.get('taskTokenBudget'),
         agent: body.agent ? selectedAgent : selectedAgent, // auto-selected specialist (body.agent reserved for explicit choice)
+        intent: effectiveIntent,
+        advisories: effectiveIntent === 'chat' ? chatAdvisories : undefined,
         memory: settings.get('memoryEnabled') ? memory : undefined,
         ctxExtras: {
           terminalTimeoutMs: settings.get('terminalTimeoutMs'),

@@ -293,6 +293,69 @@ async function runDoctor() {
   }
 }
 
+async function loadApiHub() {
+  const box = document.getElementById('api-hub');
+  if (!box) return;
+  try {
+    const { apis } = await api('/api/apis');
+    box.innerHTML = apis.map((a) => {
+      const healthBadge = a.health.configured
+        ? (a.health.inCooldown ? '<span class="badge status-failed">cooldown</span>'
+          : a.health.healthy ? '<span class="badge status-completed">● healthy</span>'
+          : '<span class="badge badge-off">configured</span>')
+        : '<span class="badge badge-off">not configured</span>';
+      const keyBadge = a.keyRequired ? '<span class="badge">API key required</span>' : '<span class="badge badge-local">no key</span>';
+      const freeBadge = `<span class="badge ${a.freeStatus === 'truly-free' ? 'badge-local' : a.freeStatus === 'free-tier' ? 'badge-free' : 'badge-off'}">${esc(a.freeStatus)}</span>`;
+      const connect = a.keyRequired
+        ? `<button class="btn btn-subtle" data-hub-get="${esc(a.keyUrl || a.officialUrl)}">🔑 Get API</button>
+           <button class="btn btn-subtle" data-hub-connect="${esc(a.id)}" data-base="${esc(a.baseUrl || '')}" data-model="${esc(a.defaultModel || '')}" data-name="${esc(a.name)}">Connect</button>`
+        : `<button class="btn btn-subtle" data-hub-connect-local="${esc(a.id)}">♻ Detect local</button>`;
+      return `<div class="hub-card">
+        <div class="approval-head"><strong>${esc(a.name)}</strong> ${freeBadge} ${keyBadge} ${healthBadge}</div>
+        <div class="small muted">${esc(a.purpose)}</div>
+        <div class="small">${esc((a.capabilities || []).join(' · '))}</div>
+        <div class="small muted">last verified: ${esc(a.lastVerified || 'never')} · ${esc(a.sourceType)}</div>
+        <div class="approval-actions">
+          <button class="btn btn-subtle" data-hub-site="${esc(a.officialUrl)}">🌐 Site</button>
+          ${connect}
+          <button class="btn btn-subtle" data-hub-test="${esc(a.id)}">⚡ Test</button>
+        </div>
+      </div>`;
+    }).join('');
+    box.querySelectorAll('[data-hub-site]').forEach((b) => { b.onclick = () => window.open(b.dataset.hubSite, '_blank', 'noopener'); });
+    box.querySelectorAll('[data-hub-get]').forEach((b) => { b.onclick = () => window.open(b.dataset.hubGet, '_blank', 'noopener'); });
+    box.querySelectorAll('[data-hub-connect-local]').forEach((b) => { b.onclick = () => refreshLocal(); });
+    box.querySelectorAll('[data-hub-connect]').forEach((b) => {
+      b.onclick = async () => {
+        const key = prompt(`Enter your legitimate API key for ${b.dataset.name} (obtained from the official site). It will be stored masked locally:`);
+        if (!key) return;
+        try {
+          await api('/api/providers', { method: 'POST', body: JSON.stringify({
+            id: b.dataset.hubConnect + '-' + Date.now().toString(36), name: b.dataset.name,
+            type: 'openai-compatible', baseUrl: b.dataset.base, model: b.dataset.model || '',
+            apiKey: key, enabled: true, priority: 50,
+          }) });
+          alert('Provider connected and saved (key masked).');
+          loadProviders();
+          loadApiHub();
+        } catch (e) { alert('Connect failed: ' + e.message); }
+      };
+    });
+    box.querySelectorAll('[data-hub-test]').forEach((b) => {
+      b.onclick = async () => {
+        b.textContent = '⟳ testing…';
+        try {
+          const r = await api('/api/providers/test', { method: 'POST', body: JSON.stringify({ id: b.dataset.hubTest }) });
+          alert(r.ok ? '✓ Connection successful (HTTP ' + r.status + ')' : '✕ Not reachable: ' + ((r.error && (r.error.friendly || r.error)) || 'HTTP ' + r.status));
+        } catch (e) { alert('✕ ' + e.message); }
+        loadApiHub();
+      };
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="muted small">' + esc(e.message) + '</div>';
+  }
+}
+
 async function loadAgents() {
   const box = document.getElementById('agents-list');
   try {
@@ -324,10 +387,15 @@ async function loadTasks() {
   taskList.innerHTML = '';
   for (const t of tasks.slice(0, 10)) {
     const el = document.createElement('div');
-    el.className = 'list-item task-item';
+    el.className = 'list-item task-item' + (['running', 'debugging', 'testing', 'waiting_approval'].includes(t.status) ? ' task-active' : '');
     const verdict = t.evaluation && t.evaluation.verdict;
     const evidenceBadge = verdict ? `<span class="badge ${verdict === 'VERIFIED' ? 'status-completed' : verdict === 'FAILED' ? 'status-failed' : 'badge-off'}">${esc(verdict)}</span>` : '';
-    el.innerHTML = `<div>${statusDot(t.status)} ${t.role ? `<span class="badge badge-local">${esc(t.role)}</span> ` : ''}${esc(t.title.slice(0, 34))}</div><div class="small muted">${esc(t.status)}${t.mode ? ` · ${esc(t.mode)}` : ''}${t.parentId ? ' · subtask' : ''} ${evidenceBadge}</div>`;
+    const isActive = ['queued', 'running', 'waiting_approval', 'testing', 'debugging'].includes(t.status);
+    const started = t.startTime ? Date.now() - new Date(t.startTime).getTime() : 0;
+    const elapsed = isActive ? `· ${Math.max(0, Math.floor(started / 1000))}s` : (t.durationMs != null ? `· ${(t.durationMs / 1000).toFixed(1)}s` : '');
+    const live = isActive && t.lastActivity ? `<div class="task-live"><span class="live-dot" aria-hidden="true"></span> ${esc(t.lastActivity.label || t.lastActivity.state)}</div>` : '';
+    el.innerHTML = `<div>${statusDot(t.status)} ${t.role ? `<span class="badge badge-local">${esc(t.role)}</span> ` : ''}${esc(t.title.slice(0, 34))}</div><div class="small muted">${esc(t.status)}${t.mode ? ` · ${esc(t.mode)}` : ''} ${elapsed} ${evidenceBadge}</div>${live}`;
+    el.setAttribute('aria-label', `Task ${esc(t.title)} — status ${esc(t.status)}`);
     el.title = `${t.status} — ${t.summary || '(no summary yet)'} \nClick to cancel if still running.`;
     el.onclick = async () => {
       if (['running', 'waiting_approval', 'testing', 'debugging', 'queued'].includes(t.status)) {
@@ -358,12 +426,58 @@ async function loadMemoryStatus() {
 
 // ---------------------------------------------------------------- agent run (SSE)
 
+let chatLiveStartedAt = null;
+let chatLiveTimer = null;
+function setChatLiveState(text) {
+  let el = document.getElementById('chat-live-state');
+  if (!text) {
+    if (el) el.remove();
+    if (chatLiveTimer) { clearInterval(chatLiveTimer); chatLiveTimer = null; }
+    chatLiveStartedAt = null;
+    return;
+  }
+  if (!chatLiveStartedAt) {
+    chatLiveStartedAt = Date.now();
+    // Elapsed ticks ~1/s (aria-hidden: announce transitions, not ticks).
+    chatLiveTimer = setInterval(() => {
+      const el2 = document.getElementById('chat-live-state');
+      if (!el2 || !chatLiveStartedAt) return;
+      const secs = Math.floor((Date.now() - chatLiveStartedAt) / 1000);
+      const tick = el2.querySelector('.chat-live-elapsed');
+      if (tick) tick.textContent = secs + 's';
+    }, 1000);
+  }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'chat-live-state';
+    el.className = 'chat-live-state';
+    el.setAttribute('role', 'status');
+    chatLog.appendChild(el);
+  }
+  const secs = chatLiveStartedAt ? Math.floor((Date.now() - chatLiveStartedAt) / 1000) : 0;
+  el.innerHTML = `<span class="live-dot" aria-hidden="true"></span> ${window.Panels ? window.Panels.esc(text) : text} <span class="chat-live-elapsed" aria-hidden="true">${secs}s</span>`;
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function setChatLiveFromEvent(event) {
+  // Canonical activity events carry label/state directly.
+  if (event.label && event.state) {
+    const icon = { queued: '⏳', planning: '🧭', thinking: '🧠', reading: '📖', searching: '🔎', editing: '✏️', waiting_approval: '⏸', running_command: '▶', running_test: '🧪', browser_running: '🌐', git_running: '⎇', provider_request: '◉', retrying: '↻' }[event.state] || '●';
+    setChatLiveState(`${icon} ${event.label}`);
+    return;
+  }
+  const icons = { UNDERSTAND: '🧠', INSPECT: '🔍', PLAN: '🧭', APPROVAL: '⏸', IMPLEMENT: '✏️', RUN: '▶', TEST: '🧪', VERIFY: '✅', FIX: '🔧', COMPLETE: '🏁' };
+  setChatLiveState(`${icons[event.state] || '●'} ${event.state.toLowerCase()} — ${(event.message || '').slice(0, 90)}`);
+}
+
 async function runTask(task) {
   const mode = modeSelect.value;
   addMessage('user', task + (mode !== 'auto' ? `  [mode: ${mode}]` : ''));
   activityLog.innerHTML = '';
   composerInput.value = '';
   sendBtn.disabled = true;
+  const startedAt = Date.now();
+  setChatLiveState('thinking…');
 
   try {
     const res = await fetch('/api/agent/run', {
@@ -394,6 +508,7 @@ async function runTask(task) {
         const event = JSON.parse(line);
         if (event.type === 'activity') {
           addActivity(event);
+          setChatLiveFromEvent(event);
         } else if (event.type === 'result') {
           addCard({
             title: resultTitle(event.status),
@@ -419,6 +534,7 @@ async function runTask(task) {
     addCard({ title: 'Connection error', body: e.message, kind: 'error' });
   } finally {
     sendBtn.disabled = false;
+    setChatLiveState(null);
     loadTasks();
   }
 }
@@ -518,6 +634,7 @@ loadSettings().then((settings) => {
   window.Panels.Explorer.renderTree().catch(() => {});
   loadSkills();
   loadAgents();
+  loadApiHub();
   const interval = settings && settings.settings ? settings.settings.uiRefreshIntervalMs : 8000;
   clearInterval(window.__wsRefresh);
   window.__wsRefresh = setInterval(() => {

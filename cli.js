@@ -41,6 +41,7 @@ const { availableSkills, matchSkills } = require('./src/skills');
 const { SettingsStore } = require('./src/settings');
 const { runDoctor } = require('./src/doctor');
 const agentsEngine = require('./src/agents');
+const apiRegistry = require('./src/api-registry');
 const { CheckpointStore } = require('./src/checkpoints');
 const { KnowledgeStore } = require('./src/knowledge');
 const { runTeam } = require('./src/orchestrator');
@@ -393,6 +394,27 @@ Team result: ${result.report.result} — ${result.summary}`);
       return;
     }
 
+    case 'apis': {
+      const [sub, arg] = opts._;
+      if (sub === 'discover') {
+        const results = apiRegistry.searchPublicApis({ q: arg, category: opts.category, capability: opts.capability, pricingType: opts.pricing, httpsOnly: opts.https === '1' });
+        console.log(`Discovery results (${results.length}) — metadata only, never auto-activated:`);
+        for (const a of results) console.log(`  • ${a.name} [${a.category}] ${a.pricingType} — ${a.description.slice(0, 70)}`);
+        return;
+      }
+      if (sub === 'recommend' && arg) {
+        for (const r of apiRegistry.recommendForCapability(arg)) console.log(`  • ${r.name} [${r.freeStatus}]${r.local ? ' LOCAL' : ''} — ${r.action}`);
+        return;
+      }
+      const apis = apiRegistry.listRegistryApis();
+      console.log(`Free API Hub registry (${apis.length} entries):`);
+      for (const a of apis) {
+        console.log(`  • ${a.name} [${a.freeStatus}]${a.local ? ' LOCAL' : ''} — ${a.capabilities.join(', ')}`);
+        console.log(`      ${a.officialUrl}`);
+      }
+      return;
+    }
+
     case 'evaluate': {
       const files = String(opts.files || '').split(',').map((f) => f.trim()).filter(Boolean);
       const taskText = opts._.join(' ') || 'unspecified task';
@@ -428,6 +450,7 @@ Team result: ${result.report.result} — ${result.summary}`);
   console.log('  knowledge                                          Show failure-knowledge episodes');
   console.log('  browser [url]                                      Browser capability (+ optional verify)');
   console.log('  evaluate --files a.js,b.js [task text]             Evidence-based quality evaluation');
+  console.log('  apis [discover|recommend <capability>]              Free API Hub registry + discovery');
   }
 }
 

@@ -643,3 +643,42 @@ select:hover { border-color: var(--accent); }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ------------------------------------------------------------------ API Hub */
+.api-hub { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; padding: 14px 18px; }
+.hub-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; background: var(--bg-elevated); box-shadow: var(--shadow-sm); }
+.hub-card .approval-actions { flex-wrap: wrap; }
+
+/* ------------------------------------------------------------------ live activity */
+.chat-live-state {
+  align-self: flex-start;
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--text-muted);
+  padding: 7px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  max-width: 90%;
+}
+.live-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent);
+  animation: livePulse 1.4s ease-in-out infinite;
+}
+.task-active { border-left: 3px solid var(--accent); }
+.task-active .small::before {
+  content: '';
+  display: inline-block;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent);
+  margin-right: 6px;
+  animation: livePulse 1.4s ease-in-out infinite;
+}
+@keyframes livePulse { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.15); } }
+
+.task-live {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 3px;
+  font-size: 11px; color: var(--accent);
+  font-family: var(--mono);
+}

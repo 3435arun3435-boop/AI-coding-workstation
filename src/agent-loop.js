@@ -16,6 +16,8 @@ const { resolveMode, getMode } = require('./modes');
 const { classifyToolRisk } = require('./risk');
 const { skillsToSystemMessage } = require('./skills');
 const { agentToSystemMessage } = require('./agents');
+const { classifyIntent } = require('./intent');
+const activity = require('./activity');
 
 const MAX_ITERATIONS = 12;
 const MAX_TOOL_CONTRACT_RETRIES = 2; // corrective retries per step, not counted against MAX_ITERATIONS
@@ -48,7 +50,7 @@ const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'run_command', 'git_c
  *   from the skills engine; injected as ADVISORY system context. Safety rules
  *   always win over skill text.
  */
-async function runAgentTask({ task, projectRoot, router, history = [], onActivity = () => {}, callFn, memory, mode: requestedMode, safetyMode = 'agent', approvals, taskId, shouldCancel, skills, advisories, retryPolicy, agent, tokenBudget, ctxExtras, maxPayloadChars }) {
+async function runAgentTask({ task, projectRoot, router, history = [], onActivity = () => {}, callFn, memory, mode: requestedMode, safetyMode = 'agent', approvals, taskId, shouldCancel, skills, advisories, retryPolicy, agent, tokenBudget, ctxExtras, maxPayloadChars, intent }) {
   const modeKey = resolveMode(requestedMode, task);
   const mode = getMode(modeKey);
   // Effective tool surface = mode tools ∩ registered tools ∩ safety-allowed tools.
@@ -56,19 +58,28 @@ async function runAgentTask({ task, projectRoot, router, history = [], onActivit
   if (safetyMode === 'readonly') {
     for (const t of MUTATING_TOOLS) allowedTools.delete(t);
   }
-  const toolSchemas = allowedTools.size === TOOL_NAMES.length ? PROVIDER_TOOL_SCHEMAS : toolSchemasFor([...allowedTools]);
+  // Intent routing (PART A): 'chat' sends NO tool schemas — no forced
+  // tool-calling, no structured-output parsing, minimal tokens.
+  let effectiveIntent = intent || null;
+  if (!effectiveIntent && (modeKey === 'ask' || modeKey === 'review')) {
+    effectiveIntent = classifyIntent(task).intent === 'task' ? 'tool-chat' : classifyIntent(task).intent;
+  }
+  const noTools = effectiveIntent === 'chat';
+  let toolSchemas = noTools ? [] : (allowedTools.size === TOOL_NAMES.length ? PROVIDER_TOOL_SCHEMAS : toolSchemasFor([...allowedTools]));
 
   const ctx = { projectRoot, mode: modeKey, safetyMode, approvals, taskId, ...(ctxExtras || {}) };
-  const messages = [
-    {
-      role: 'system',
-      content:
-        'You are a local coding agent. You may only call tools from the provided tool list. ' +
-        `Available tools: ${Array.from(allowedTools).join(', ')}. Never invent a tool name. ` +
-        'Work iteratively: inspect before editing, run tests after changing code, and stop when the task is verifiably complete. ' +
-        mode.instructions,
-    },
-  ];
+  // Chat intent: a DIFFERENT system prompt — no tool language at all, so
+  // tool-primed models don't hallucinate tool calls without schemas.
+  const systemContent = noTools
+    ? 'You are a knowledgeable software engineering assistant. Answer in PLAIN TEXT. ' +
+      'Do not attempt to call tools or emit JSON tool-call structures. ' +
+      'If the answer needs project details you do not have, say exactly what is missing. ' +
+      mode.instructions
+    : 'You are a local coding agent. You may only call tools from the provided tool list. ' +
+      `Available tools: ${Array.from(allowedTools).join(', ')}. Never invent a tool name. ` +
+      'Work iteratively: inspect before editing, run tests after changing code, and stop when the task is verifiably complete. ' +
+      mode.instructions;
+  const messages = [{ role: 'system', content: systemContent }];
 
   emit(onActivity, 'UNDERSTAND', `Mode: ${mode.label} — ${mode.description}`);
 
@@ -109,6 +120,8 @@ async function runAgentTask({ task, projectRoot, router, history = [], onActivit
   let tokensUsed = 0;
   let payloadCap = maxPayloadChars || 0;
   let compactedOnce = false;
+  let parseRecoveryUsed = 0;
+  let toolsDroppedForParseRecovery = false;
   const testsRun = [];
   const toolLog = [];
   let lastProvider = null;
@@ -156,6 +169,8 @@ async function runAgentTask({ task, projectRoot, router, history = [], onActivit
     }
     let routed;
     let contractRetries = 0;
+    const providerStart = Date.now();
+    let lastCandidate = null;
     // Inner retry loop: ONLY for tool-contract violations (model hallucinated an
     // undeclared tool name and the provider rejected the turn before we got a
     // usable tool_call back). Switching providers won't fix this — it's a model
@@ -163,12 +178,40 @@ async function runAgentTask({ task, projectRoot, router, history = [], onActivit
     // and retry the same step, bounded, before giving up gracefully.
     for (;;) {
       try {
-        routed = await router.chat({ messages: compactMessages(messages, payloadCap), tools: toolSchemas, orderContext: { mode: modeKey, task }, retryPolicy }, callFn);
+        emitActivityEvent(onActivity, activity.makeEvent({ taskId, agent: agent ? agent.label : null, startedAt: providerStart, state: 'provider_request', label: '◉ Contacting provider…', detail: 'provider request' }));
+        routed = await router.chat({
+          messages: compactMessages(messages, payloadCap),
+          tools: toolSchemas,
+          orderContext: { mode: modeKey, task },
+          retryPolicy,
+          onRetry: (provider, hint) => {
+            emitActivityEvent(onActivity, activity.makeEvent({ taskId, agent: agent ? agent.label : null, provider, startedAt: providerStart, ...activity.activityForProviderRetry(provider, hint) }));
+          },
+        }, callFn);
       } catch (e) {
         emit(onActivity, 'FIX', `Provider call threw unexpectedly: ${e.message}`);
         return finish({ status: 'error', summary: `Provider error: ${e.message}`, filesChanged, testsRun, toolLog });
       }
 
+      // PART A recovery: output_parse_failed — the provider could not parse
+      // the generation. Bounded recovery: first retry WITHOUT tool schemas
+      // (plain chat), then a corrective reminder. Never unbounded, never
+      // collapsed into all_providers_failed without attempting recovery.
+      if (!routed.ok && routed.outputParseFailed && parseRecoveryUsed < 2) {
+        parseRecoveryUsed++;
+        if (!toolsDroppedForParseRecovery && !noTools) {
+          toolsDroppedForParseRecovery = true;
+          toolSchemas = [];
+          emit(onActivity, 'FIX', 'Provider could not parse the tool-call output — retrying as plain chat without tool schemas');
+        } else {
+          emit(onActivity, 'FIX', 'Provider parse failure again — retrying with an explicit plain-text instruction');
+          messages.push({
+            role: 'system',
+            content: 'Your previous response could not be parsed by the provider. Reply in PLAIN TEXT only: no tool calls, no JSON, no special formatting.',
+          });
+        }
+        continue;
+      }
       if (!routed.ok && routed.isToolContractViolation && contractRetries < MAX_TOOL_CONTRACT_RETRIES) {
         contractRetries++;
         emit(onActivity, 'FIX', `Model attempted a tool that doesn't exist here — sending a correction and retrying (attempt ${contractRetries})`);
@@ -184,6 +227,23 @@ async function runAgentTask({ task, projectRoot, router, history = [], onActivit
     if (routed.ok) {
       lastProvider = routed.provider || lastProvider;
       lastModel = routed.model || lastModel;
+      // Real fallback transitions only — from the router's own fallbackLog.
+      const fb = routed.fallbackLog || [];
+      for (let fi = 0; fi < fb.length; fi++) {
+        const to = fi === fb.length - 1 ? routed.provider : fb[fi + 1].provider;
+        if (to) {
+          emitActivityEvent(onActivity, activity.makeEvent({
+            taskId, agent: agent ? agent.label : null,
+            provider: to, startedAt: providerStart,
+            ...activity.activityForFallback(fb[fi].provider, to),
+          }));
+        }
+      }
+      emitActivityEvent(onActivity, activity.makeEvent({
+        taskId, agent: agent ? agent.label : null, provider: routed.provider, model: routed.model,
+        startedAt: providerStart,
+        state: 'thinking', label: `🧠 Working with ${routed.provider}${routed.model ? ' · ' + routed.model : ''}`, detail: 'provider request completed',
+      }));
     }
 
     if (routed.fallbackLog && routed.fallbackLog.length > 0) {
@@ -221,6 +281,25 @@ async function runAgentTask({ task, projectRoot, router, history = [], onActivit
           `. Try a shorter task, or use a provider/model with a larger quota.`;
         emit(onActivity, 'FIX', `Request too large for the provider — ${advice}`);
         return finish({ status: 'blocked', summary: `BLOCKED: request too large for the provider. ${advice}`, filesChanged, testsRun, toolLog });
+      }
+      if (routed.outputParseFailed) {
+        // Recovery exhausted: name the real failure and the next action —
+        // never the misleading "all_providers_failed".
+        const advice =
+          'The provider could not parse the model output (output_parse_failed) even after retrying ' +
+          'without tool schemas and with plain-text instructions. Try a different provider/model, or rephrase the task.';
+        emit(onActivity, 'FIX', advice);
+        return finish({ status: 'error', summary: `ERROR: ${advice}`, filesChanged, testsRun, toolLog });
+      }
+      // Rate-limit honesty: name the quota type and the provider's own wait hint.
+      const rl = (routed.fallbackLog || []).find((f) => f.quotaExhausted || f.retryAfterHint);
+      if (rl) {
+        const advice =
+          `RATE_LIMITED: provider "${rl.provider}" ${rl.quotaExhausted ? 'daily/total quota is exhausted' : 'is rate-limited'}` +
+          (rl.retryAfterHint ? ` — provider says retry after ${rl.retryAfterHint}` : '') +
+          '. Try another provider/model (Settings → AI), enable a local Ollama model, or wait.';
+        emit(onActivity, 'FIX', advice);
+        return finish({ status: 'blocked', summary: `BLOCKED: ${advice}`, filesChanged, testsRun, toolLog });
       }
       emit(onActivity, 'FIX', `No provider could serve the request: ${routed.error}${routed.lastError ? ` (last error: ${String(routed.lastError).slice(0, 200)})` : ''}`);
       return finish({ status: 'error', summary: `All configured providers failed: ${routed.error}${routed.lastError ? ` — last error: ${String(routed.lastError).slice(0, 300)}` : ''}`, filesChanged, testsRun, toolLog });
@@ -263,7 +342,14 @@ async function runAgentTask({ task, projectRoot, router, history = [], onActivit
       const name = call.function ? call.function.name : call.name;
       const rawArgs = call.function ? call.function.arguments : call.arguments;
 
-      emit(onActivity, phaseFor(name), `Calling ${name}`);
+      // Tool activity (PART C): canonical state from the real tool + args.
+      const toolArgs = parseToolArgs(rawArgs) || {};
+      const toolActivity = activity.activityForTool(name, toolArgs);
+      if (toolActivity) {
+        emitActivityEvent(onActivity, activity.makeEvent({ taskId, agent: agent ? agent.label : null, tool: name, ...toolActivity }));
+      } else {
+        emit(onActivity, phaseFor(name), `Calling ${name}`);
+      }
 
       // Server-side mode enforcement: the tool surface declared to the model is
       // already filtered, but never trust the model — reject anything outside
@@ -363,6 +449,11 @@ function safeCommandFromArgs(rawArgs) {
 
 function emit(onActivity, state, message) {
   onActivity({ state, message, ts: new Date().toISOString() });
+}
+
+/** Canonical activity event: full structured payload on the same SSE pipe. */
+function emitActivityEvent(onActivity, event) {
+  onActivity({ ...event, type: 'activity' });
 }
 
 // --- context budget (request-size control) -----------------------------------

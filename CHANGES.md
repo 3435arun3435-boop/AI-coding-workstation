@@ -193,3 +193,33 @@ the opaque "all providers failed". Settings: `toolResultCharLimit`,
 `maxPayloadChars`. Tests: `test/bug-413.test.js` (5). UI: live status bar
 (git/tests/provider/tokens/safety), activity state icons, a11y
 (skip-link/tablist/aria-selected), reduced-motion support.
+
+## 2.3.0 — Unified live-activity UX + Free API Hub + chat intent routing
+
+- **Chat intent routing (`src/intent.js`)** — "Analyze this project and give me
+  a report" no longer runs through the tool loop: plain chat sends ZERO tool
+  schemas (fixes the reported Groq `output_parse_failed` bug at its root);
+  inspection requests keep read-only tools; engineering verbs run the full
+  loop. Chat requests for the active project receive a compact auto-generated
+  project context (map + file tree, no file dumps).
+- **Parse-failure recovery** — `output_parse_failed` / "Tool choice is none,
+  but model called a tool" now trigger bounded recovery (retry without tools →
+  plain-text corrective retry → provider fallback without cooldown poisoning →
+  actionable named error). Never collapsed into all_providers_failed.
+- **Free API Hub (`src/api-registry.js`)** — 9-entry registry (Groq, Gemini,
+  GitHub Models, OpenRouter, Ollama, GitHub REST, Tavily, Brave, Nomic) with
+  honest free-status classification (truly-free/free-tier/trial-credits),
+  capability tags, verification metadata; public-apis discovery
+  (search/filter, normalized metadata, never auto-activated); capability
+  recommendations; multi-key pool UI (`POST /api/providers/keys`, masked).
+- **Unified live activity (`src/activity.js`)** — canonical state model
+  (provider_request/thinking/reading/searching/editing/running_test/
+  git_running/browser_running/waiting_approval/retrying + terminals) emitted
+  on the existing SSE pipe with real provider/model/tool/args; task records
+  carry `lastActivity`; task rows show live labels + elapsed; chat shows a
+  WhatsApp-style "● Thinking… Ns" indicator that appears on activity and
+  clears on completion; per-file conflict ownership hardened; stale-task
+  recovery unchanged.
+- Rate-limit honesty: daily-quota exhaustion + in-body "try again in X"
+  hints surfaced as actionable BLOCKED messages.
+- Tests 200 → **220** (`test/activity.test.js` 13, `test/chat-intent.test.js` 7).

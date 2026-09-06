@@ -131,7 +131,7 @@ class ProviderRouter {
    * are shortened to waitMs and another pass runs — bounded passes, always
    * waiting between them, never hammering (§ retry within bounded policy).
    */
-  async chat({ messages, tools, orderContext, retryPolicy }, callFn = callOpenAICompatible) {
+  async chat({ messages, tools, orderContext, retryPolicy, onRetry }, callFn = callOpenAICompatible) {
     const passes = retryPolicy ? Math.max(1, Math.min(Number(retryPolicy.passes) || 1, 3)) : 1;
     const waitMs = retryPolicy ? Math.max(1000, Math.min(Number(retryPolicy.waitMs) || 5000, 30000)) : 5000;
     for (let pass = 0; pass < passes; pass++) {
@@ -195,14 +195,14 @@ class ProviderRouter {
         return { ok: true, response, provider: entry.id, model: entry.model, latencyMs: latency, fallbackLog };
       } catch (err) {
         const status = err && err.status;
-        const retryable = status === 429 || (status >= 500 && status < 600) || err.code === 'NETWORK_ERROR';
-        fallbackLog.push({ provider: entry.id, error: err.message, status: status || null, retryable, isToolContractViolation: !!err.isToolContractViolation, retryAfterMs: err.retryAfterMs || null, staleModel: !!err.staleModel, requestTooLarge: !!err.requestTooLarge, sizeLimit: err.sizeLimit || null, sizeRequested: err.sizeRequested || null });
+        const retryable = status === 429 || (status >= 500 && status < 600) || err.code === 'NETWORK_ERROR' || !!err.outputParseFailed;
+        fallbackLog.push({ provider: entry.id, error: err.message, status: status || null, retryable, isToolContractViolation: !!err.isToolContractViolation, outputParseFailed: !!err.outputParseFailed, retryAfterMs: err.retryAfterMs || null, staleModel: !!err.staleModel, requestTooLarge: !!err.requestTooLarge, sizeLimit: err.sizeLimit || null, sizeRequested: err.sizeRequested || null, retryAfterHint: err.retryAfterHint || null, quotaExhausted: !!err.quotaExhausted });
         s.usage.failures += 1;
         s.usage.lastLatencyMs = Date.now() - start;
         if (err.staleModel) s.staleModel = true;
         lastErr = err;
         if (retryable) {
-          this.markCooldown(entry.id, DEFAULT_COOLDOWN_MS, err);
+          if (!err.outputParseFailed) this.markCooldown(entry.id, DEFAULT_COOLDOWN_MS, err);
           continue; // try next eligible provider — bounded by candidates.length
         }
         // Non-retryable (e.g. bad request, invalid model) — stop, don't burn through keys pointlessly
@@ -215,6 +215,7 @@ class ProviderRouter {
       error: 'all_providers_failed',
       lastError: lastErr ? lastErr.message : null,
       lastErrorRequestTooLarge: !!(lastErr && lastErr.requestTooLarge),
+      outputParseFailed: !!(lastErr && lastErr.outputParseFailed),
       lastErrorSizeLimit: (lastErr && lastErr.sizeLimit) || null,
       lastErrorSizeRequested: (lastErr && lastErr.sizeRequested) || null,
       isToolContractViolation: !!(lastErr && lastErr.isToolContractViolation),
@@ -328,6 +329,8 @@ async function callOpenAICompatible(entry, { messages, tools }) {
       ...(entry.apiKey ? { Authorization: `Bearer ${entry.apiKey}` } : {}),
     },
     body: JSON.stringify({ model: entry.model, messages, tools }),
+    // Bounded request: a hung connection must never stall a task forever.
+    signal: AbortSignal.timeout(Number(entry.timeoutMs) || 120_000),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -342,6 +345,13 @@ async function callOpenAICompatible(entry, { messages, tools }) {
     // Stale/deprecated model detection (spec 00a737): a 404 naming the model.
     if (res.status === 404 && /does not exist|no longer available|deprecat/i.test(text)) {
       err.staleModel = true;
+    }
+    // Rate-limit body hints (some providers put the wait in the message body,
+    // not headers) + daily-quota detection for honest RATE_LIMITED reporting.
+    if (res.status === 429) {
+      const hint = text.match(/try again in ([\dhms.]+)/i);
+      if (hint) err.retryAfterHint = hint[1];
+      err.quotaExhausted = /tokens per day|daily quota|quota exceeded/i.test(text);
     }
     // The model called a tool name that wasn't in the `tools` array we sent
     // (e.g. it hallucinated a tool from a different agent framework, like
