@@ -180,3 +180,16 @@ Final directive implementation on top of 2.0 (baseline 153/153 → 180/180):
   `settings`, `knowledge`, `browser`, `evaluate`. **UI** — Agents panel,
   evaluator verdict badges, new settings fields.
 - Tests 180 → **195** (`test/agency.test.js`, 15 new).
+
+### 2.2.1 — Fix: "Request too large" (HTTP 413) on small-TPM providers
+Reported: `HTTP 413: Request too large for model 'openai/gpt-oss-120b' … TPM:
+Limit 8000, Requested 8007`. Root cause: tool results (a `read_file` can
+return 512KB) and the conversation were re-sent unbounded on every provider
+request. Fix: tool results are bounded in the conversation (head+tail with an
+honest marker), the payload is compacted before each request (system messages
+always kept, honest tombstone), a 413 triggers ONE bounded compaction-retry,
+and a surviving 413 reports an actionable BLOCKED naming the limit — never
+the opaque "all providers failed". Settings: `toolResultCharLimit`,
+`maxPayloadChars`. Tests: `test/bug-413.test.js` (5). UI: live status bar
+(git/tests/provider/tokens/safety), activity state icons, a11y
+(skip-link/tablist/aria-selected), reduced-motion support.
