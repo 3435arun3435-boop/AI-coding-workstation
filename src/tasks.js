@@ -48,7 +48,7 @@ class TaskStore {
     fs.writeFileSync(this.filePath, JSON.stringify(this.tasks, null, 2), 'utf8');
   }
 
-  create({ title, project, provider, model, mode, parentId = null, role = null }) {
+  create({ title, project, provider, model, mode, parentId = null, role = null, resumedFrom = null }) {
     const record = {
       id: crypto.randomUUID(),
       title,
@@ -58,6 +58,7 @@ class TaskStore {
       mode: mode || null,
       parentId: parentId || null,
       role: role || null,
+      resumedFrom: resumedFrom || null,
       startTime: new Date().toISOString(),
       endTime: null,
       durationMs: null,

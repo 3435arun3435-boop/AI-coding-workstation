@@ -334,6 +334,65 @@ const routes = {
     sendJSON(res, 200, { ok: true, provider: updated });
   },
 
+  // Task resume (PART §0/§8): continue a BLOCKED/failed task from its
+  // checkpoint + prior evidence. Work is preserved, never restarted from zero.
+  'POST /api/tasks/resume': async (req, res) => {
+    const body = await readBody(req);
+    const original = body.id ? tasks.get(body.id) : null;
+    if (!original) return sendJSON(res, 404, { ok: false, error: 'Task not found' });
+    if (!['blocked', 'failed', 'error'].includes(original.status)) {
+      return sendJSON(res, 400, { ok: false, error: `Task is ${original.status} — only blocked/failed tasks can be resumed` });
+    }
+    const project = config.getActiveProject();
+    if (!project) return sendJSON(res, 400, { ok: false, error: 'No active project selected' });
+    const ck = checkpoints.list(project.rootPath).find((c) => c.taskId === original.id) || checkpoints.list(project.rootPath)[0] || null;
+    sendJSON(res, 200, {
+      ok: true,
+      resumePayload: {
+        resumeTaskId: original.id,
+        task: original.title,
+        mode: original.mode || 'autonomous',
+        checkpointId: ck ? ck.id : null,
+      },
+    });
+  },
+
+  // Per-key management (PART §23/§25): remove/disable/enable a single
+  // pooled credential. Masked output only — raw keys never leave the store.
+  'POST /api/providers/keys/remove': async (req, res) => {
+    const body = await readBody(req);
+    const provider = body.id ? config.listProviders().find((p) => p.id === body.id) : null;
+    if (!provider) return sendJSON(res, 404, { ok: false, error: 'Provider not found' });
+    const idx = Number(body.index);
+    const pool = Array.isArray(provider.keys) ? provider.keys.slice() : (provider.apiKey ? [provider.apiKey] : []);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= pool.length) return sendJSON(res, 400, { ok: false, error: 'index out of range' });
+    const removed = `...${String(pool[idx]).slice(-4)}`;
+    pool.splice(idx, 1);
+    config.upsertProvider({ id: provider.id, keys: pool, apiKey: pool[0] || '' });
+    sendJSON(res, 200, { ok: true, removed, remaining: config.listProvidersMasked().find((p) => p.id === provider.id).keysMasked || [] });
+  },
+
+  'POST /api/providers/keys/toggle': async (req, res) => {
+    const body = await readBody(req);
+    const provider = body.id ? config.listProviders().find((p) => p.id === body.id) : null;
+    if (!provider) return sendJSON(res, 404, { ok: false, error: 'Provider not found' });
+    config.upsertProvider({ id: provider.id, enabled: !!body.enabled });
+    sendJSON(res, 200, { ok: true, enabled: !!body.enabled });
+  },
+
+  'GET /api/providers/keys': async (req, res, parsedUrl) => {
+    const provider = parsedUrl.query.id ? config.listProviders().find((p) => p.id === parsedUrl.query.id) : null;
+    if (!provider) return sendJSON(res, 404, { ok: false, error: 'Provider not found' });
+    const pool = Array.isArray(provider.keys) ? provider.keys : (provider.apiKey ? [provider.apiKey] : []);
+    sendJSON(res, 200, {
+      ok: true,
+      id: provider.id,
+      enabled: provider.enabled !== false,
+      priority: provider.priority ?? 100,
+      keys: pool.map((k, i) => ({ index: i, masked: `...${String(k).slice(-4)}` })),
+    });
+  },
+
   // Knowledge base inspection.
   'GET /api/knowledge': async (req, res) => {
     const project = config.getActiveProject();
@@ -429,12 +488,45 @@ const routes = {
     const provider = config.listProviders().find((p) => p.id === body.id);
     if (!provider) return sendJSON(res, 404, { ok: false, error: 'Provider not found' });
     try {
-      const url2 = `${provider.baseUrl.replace(/\/$/, '')}/models`;
-      const r = await fetch(url2, {
-        headers: provider.apiKey ? { Authorization: `Bearer ${provider.apiKey}` } : {},
-        signal: AbortSignal.timeout(10_000),
-      });
-      sendJSON(res, 200, { ok: r.ok, status: r.status });
+      // Key-pool aware: test EVERY credential; invalid keys are pruned from
+      // the pool automatically (never retried, per §5) and the user is told.
+      const poolKeys = Array.isArray(provider.keys) && provider.keys.length
+        ? provider.keys
+        : (provider.apiKey ? [provider.apiKey] : []);
+      if (provider.type === 'tavily') {
+        const key = poolKeys[0] || null;
+        const r = await fetch('https://api.tavily.com/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ api_key: key, query: 'connection test', max_results: 1 }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        sendJSON(res, 200, { ok: r.ok, status: r.status });
+        return;
+      }
+      const perKey = [];
+      const validKeys = [];
+      for (const k of poolKeys) {
+        try {
+          const r = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/models`, {
+            headers: k ? { Authorization: `Bearer ${k}` } : {},
+            signal: AbortSignal.timeout(10_000),
+          });
+          perKey.push({ masked: `...${String(k).slice(-4)}`, status: r.status, ok: r.ok });
+          // Only INVALID credentials are pruned. 429/exhausted keys stay in the
+          // pool — they are temporary/exhausted, not broken (per §5).
+          if (r.ok || ![401, 403].includes(r.status)) validKeys.push(k);
+          else perKey[perKey.length - 1].pruned = 'invalid';
+        } catch (e) {
+          perKey.push({ masked: `...${String(k).slice(-4)}`, status: 0, ok: false, error: e.message });
+        }
+      }
+      if (poolKeys.length > 0) {
+        if (validKeys.length) config.upsertProvider({ id: provider.id, keys: validKeys });
+        else config.upsertProvider({ id: provider.id, keys: [], apiKey: '' , enabled: provider.enabled }); // all invalid — pool emptied
+      }
+      const okAny = validKeys.length > 0;
+      sendJSON(res, 200, { ok: okAny, status: okAny ? 200 : (perKey[0] ? perKey[0].status : 0), keys: perKey, pruned: poolKeys.length - validKeys.length });
     } catch (e) {
       sendJSON(res, 200, { ok: false, error: friendlyError(e) });
     }
@@ -737,6 +829,12 @@ const routes = {
       Connection: 'keep-alive',
     });
 
+    function emitResumeNote(fn, checkpointId, originalId) {
+      const msg = checkpointId
+        ? `↪ Resuming from checkpoint ${checkpointId} (task ${String(originalId).slice(0, 8)}) — prior work preserved`
+        : '↪ Resuming task — no checkpoint existed, continuing with prior evidence';
+      fn({ state: 'PLAN', message: msg, ts: new Date().toISOString() });
+    }
     const verbosity = settings.get('activityVerbosity');
     const onActivity = (event) => {
       // Settings → UI → activity verbosity: 'normal' hides tool-level detail
@@ -769,6 +867,33 @@ const routes = {
         matchedSkills = matchSkills(project.rootPath, body.task, { map: null });
       } catch {
         matchedSkills = null;
+      }
+
+      // Task resume (§0/§8): continue prior work from its checkpoint and
+      // evidence — never restart from zero after a credential switch.
+      let resumeAdvisory = null;
+      if (body.resumeTaskId) {
+        const original = tasks.get(body.resumeTaskId);
+        if (original) {
+          record.resumedFrom = original.id;
+          const ck = checkpoints.list(project.rootPath).find((c) => c.taskId === original.id) || checkpoints.list(project.rootPath)[0] || null;
+          resumeAdvisory = {
+            role: 'system',
+            content:
+              'TASK RESUME: this task was previously interrupted by a provider/credential failure. ' +
+              'Continue from the checkpoint — do NOT restart from zero. Before re-editing any file, ' +
+              'inspect its current state (previous operations may have completed).\n' +
+              JSON.stringify({
+                originalTask: original.title,
+                priorStatus: original.status,
+                priorSummary: original.summary,
+                filesAlreadyChanged: original.filesChanged,
+                checkpoint: ck ? { id: ck.id, files: ck.files.map((f) => f.path) } : null,
+                instruction: 'Verify what is already done (tests/files), then continue the remaining work.',
+              }, null, 2).slice(0, 4000),
+          };
+          emitResumeNote(onActivity, ck ? ck.id : null, original.id);
+        }
       }
 
       // Intent routing (PART A): the smallest useful execution path.
@@ -832,7 +957,7 @@ const routes = {
         tokenBudget: settings.get('taskTokenBudget'),
         agent: body.agent ? selectedAgent : selectedAgent, // auto-selected specialist (body.agent reserved for explicit choice)
         intent: effectiveIntent,
-        advisories: effectiveIntent === 'chat' ? chatAdvisories : undefined,
+        advisories: resumeAdvisory ? [resumeAdvisory, ...(effectiveIntent === 'chat' ? chatAdvisories : [])] : (effectiveIntent === 'chat' ? chatAdvisories : undefined),
         memory: settings.get('memoryEnabled') ? memory : undefined,
         ctxExtras: {
           terminalTimeoutMs: settings.get('terminalTimeoutMs'),

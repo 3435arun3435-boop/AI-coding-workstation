@@ -223,3 +223,29 @@ the opaque "all providers failed". Settings: `toolResultCharLimit`,
 - Rate-limit honesty: daily-quota exhaustion + in-body "try again in X"
   hints surfaced as actionable BLOCKED messages.
 - Tests 200 → **220** (`test/activity.test.js` 13, `test/chat-intent.test.js` 7).
+
+## 2.4.0 — Continuous multi-provider execution (credential pool + resume)
+
+The core guarantee: **a provider credential is replaceable — the engineering task is not.**
+
+- **Credential failure classification (`src/credentials.js`)** — temporary
+  (429/5xx/network → bounded cooldown), exhausted (daily/weekly/monthly quota →
+  unavailable until the provider-reported reset time, honestly `unknown` when
+  unreported), invalid (401/invalid/revoked → disabled until user re-verifies,
+  never auto-retried).
+- **Router pool integration** — exhausted/invalid keys skip to the next
+  candidate; invalid keys pruned from the pool by the connection test
+  (temporary keys are NEVER pruned); Retry-After/body hints honored;
+  network-level errors fail over instead of breaking the chain; malformed 200
+  responses (HTML from misconfigured gateways) no longer break fallback.
+- **Bounded retry passes** no longer shorten exhausted keys' cooldowns (that
+  hammered dead quotas and starved the fallback chain).
+- **Task resume** — `POST /api/tasks/resume` + `resumeTaskId` on
+  `/api/agent/run`: a blocked/failed task continues from its checkpoint and
+  prior evidence (files changed, summary) with an explicit resume advisory —
+  work is never restarted from zero after a credential switch.
+- **Provider key management** — per-key test with masked per-key results,
+  invalid-key pruning, remove endpoint + UI, key-pool-aware connection tests.
+- Live evidence: with Groq's daily quota exhausted mid-task, the workstation
+  automatically fell through the pool (Groq → … → OpenRouter) and completed a
+  resumed engineering task with real tool calls on OpenRouter.

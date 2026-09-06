@@ -26,6 +26,7 @@
  */
 
 const DEFAULT_COOLDOWN_MS = 60_000;
+const { classifyCredentialFailure, cooldownFor } = require('./credentials');
 const MODEL_CACHE_TTL_MS = 5 * 60_000;
 const modelCache = new Map(); // key 2192 { at, result }
 const MODEL_LIST_TIMEOUT_MS = 5_000;
@@ -79,7 +80,7 @@ class ProviderRouter {
   eligibleEntries(orderContext) {
     const now = Date.now();
     const filtered = this.entries()
-      .filter((e) => e.enabled !== false && e.cooldownUntil <= now)
+      .filter((e) => e.enabled !== false && e.cooldownUntil <= now && !e.invalid)
       .sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
     if (this.orderFn) return this.orderFn(filtered, orderContext || {});
     return filtered;
@@ -139,19 +140,23 @@ class ProviderRouter {
       if (result.ok || pass === passes - 1) return result;
       const hadTransient = (result.fallbackLog || []).some((f) => f.retryable);
       if (!hadTransient) return result;
-      // Shorten transient-failure cooldowns to the retry spacing, wait, retry.
-      // If the provider sent Retry-After, respect the LARGEST hint (capped 30s).
+      // Shorten TRANSIENT-failure cooldowns to the retry spacing, wait, retry.
+      // EXHAUSTED keys keep their reset-time cooldown — retrying them in 15s
+      // would hammer a dead quota and starve the fallback chain (never do it).
+      const transientFailures = (result.fallbackLog || []).filter((f) => f.retryable && (!f.credential || f.credential.kind === 'temporary'));
       const hintMs = Math.max(0, ...(result.fallbackLog || []).map((f) => f.retryAfterMs || 0));
       const effectiveWait = Math.min(Math.max(waitMs, hintMs), 30000);
+      for (const f of transientFailures) {
+        const s = this._raw(f.provider);
+        s.cooldownUntil = Date.now() + effectiveWait;
+      }
       for (const f of result.fallbackLog) {
-        if (f.retryable) {
-          const s = this._raw(f.provider);
-          s.cooldownUntil = Date.now() + effectiveWait;
-        }
         if (f.staleModel) {
           this._raw(f.provider).staleModel = true;
         }
       }
+      // If nothing transient remains to retry, stop immediately.
+      if (transientFailures.length === 0) return result;
       await new Promise((r) => setTimeout(r, effectiveWait));
     }
   }
@@ -195,15 +200,42 @@ class ProviderRouter {
         return { ok: true, response, provider: entry.id, model: entry.model, latencyMs: latency, fallbackLog };
       } catch (err) {
         const status = err && err.status;
-        const retryable = status === 429 || (status >= 500 && status < 600) || err.code === 'NETWORK_ERROR' || !!err.outputParseFailed;
-        fallbackLog.push({ provider: entry.id, error: err.message, status: status || null, retryable, isToolContractViolation: !!err.isToolContractViolation, outputParseFailed: !!err.outputParseFailed, retryAfterMs: err.retryAfterMs || null, staleModel: !!err.staleModel, requestTooLarge: !!err.requestTooLarge, sizeLimit: err.sizeLimit || null, sizeRequested: err.sizeRequested || null, retryAfterHint: err.retryAfterHint || null, quotaExhausted: !!err.quotaExhausted });
+        // status undefined = the request never got an HTTP response (bad URL,
+        // DNS, connection refused…) — network-level, so fail over.
+        const retryable = status === 429 || (status >= 500 && status < 600) || err.code === 'NETWORK_ERROR' || status === undefined || !!err.outputParseFailed;
+        // Credential-failure classification (multi-key pool §3-§5).
+        const bodyText = String(err.message || '');
+        const cred = classifyCredentialFailure({ status: status || null, text: bodyText });
+        cred.retryAfterHint = err.retryAfterHint || cred.retryAfterHint;
+        if (cred.kind === 'exhausted' && err.retryAfterHint) cred.resetAt = cred.retryAfterHint ? (require('./credentials').parseRelativeHint(err.retryAfterHint) || cred.resetAt) : cred.resetAt;
+        if (cred.kind === 'invalid') s.invalid = true;
+        if (cred.kind === 'exhausted') { s.quotaState = 'exhausted'; s.resetAt = cred.resetAt || 'unknown'; }
+        s.credentialState = cred.kind;
+        fallbackLog.push({ provider: entry.id, error: err.message, status: status || null, retryable, isToolContractViolation: !!err.isToolContractViolation, outputParseFailed: !!err.outputParseFailed, retryAfterMs: err.retryAfterMs || null, staleModel: !!err.staleModel, requestTooLarge: !!err.requestTooLarge, sizeLimit: err.sizeLimit || null, sizeRequested: err.sizeRequested || null, retryAfterHint: err.retryAfterHint || null, quotaExhausted: !!err.quotaExhausted, credential: { kind: cred.kind, resetAt: cred.resetAt, quotaState: cred.quotaState } });
         s.usage.failures += 1;
         s.usage.lastLatencyMs = Date.now() - start;
         if (err.staleModel) s.staleModel = true;
         lastErr = err;
-        if (retryable) {
-          if (!err.outputParseFailed) this.markCooldown(entry.id, DEFAULT_COOLDOWN_MS, err);
-          continue; // try next eligible provider — bounded by candidates.length
+        if (retryable || cred.kind !== 'temporary') {
+          // Exhausted/invalid keys skip straight to the next candidate;
+          // temporary failures cool down per classification.
+          const cd = cooldownFor(cred);
+          s.healthy = false;
+          s.retryCount += 1;
+          s.lastError = err.message;
+          if (Number.isFinite(cd)) s.cooldownUntil = Date.now() + cd;
+          else s.cooldownUntil = Number.MAX_SAFE_INTEGER; // invalid: out until user re-enables
+          if (cred.kind === 'invalid' && typeof this.onCredentialInvalid === 'function') {
+            try { this.onCredentialInvalid(entry.id, s); } catch { /* persistence is server-side */ }
+          }
+          if (err.outputParseFailed) {
+            // Parse failures are a MODEL/format problem, not provider health:
+            // no cooldown, so the loop's no-tools recovery can retry this
+            // provider immediately.
+            s.cooldownUntil = 0;
+            s.healthy = true;
+          }
+          continue; // try next eligible candidate — bounded by candidates.length
         }
         // Non-retryable (e.g. bad request, invalid model) — stop, don't burn through keys pointlessly
         break;
@@ -237,6 +269,10 @@ class ProviderRouter {
       inCooldown: e.cooldownUntil > Date.now(),
       cooldownRemainingMs: Math.max(0, e.cooldownUntil - Date.now()),
       lastError: e.lastError,
+      credentialState: e.credentialState || (e.healthy ? 'ok' : 'unknown'),
+      quotaState: e.quotaState || null,
+      resetAt: e.resetAt || null,
+      invalid: !!e.invalid,
       staleModel: !!e.staleModel,
       lastTestedAt: e.lastTestedAt,
       retryCount: e.retryCount,
@@ -350,7 +386,7 @@ async function callOpenAICompatible(entry, { messages, tools }) {
     // not headers) + daily-quota detection for honest RATE_LIMITED reporting.
     if (res.status === 429) {
       const hint = text.match(/try again in ([\dhms.]+)/i);
-      if (hint) err.retryAfterHint = hint[1];
+      if (hint) err.retryAfterHint = hint[1].replace(/\.+$/, '');
       err.quotaExhausted = /tokens per day|daily quota|quota exceeded/i.test(text);
     }
     // The model called a tool name that wasn't in the `tools` array we sent
@@ -364,7 +400,16 @@ async function callOpenAICompatible(entry, { messages, tools }) {
     err.isToolContractViolation = res.status === 400 && /not in request\.tools|tool call validation failed|which was not in request/i.test(text);
     throw err;
   }
-  return res.json();
+  // A 200 with an unparseable body (e.g. an HTML page from a misconfigured
+  // gateway) is a provider failure like any other — it must NOT break the
+  // fallback chain silently.
+  const parsed = await res.json().catch(() => null);
+  if (parsed === null || typeof parsed !== 'object') {
+    const err = new Error(`Provider ${entry.id} returned an unparseable response body`);
+    err.status = 502;
+    throw err;
+  }
+  return parsed;
 }
 
 module.exports = {

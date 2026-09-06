@@ -146,13 +146,35 @@ async function loadProviders() {
       el.innerHTML = `<div>⟳ testing ${esc(p.name)}…</div>`;
       try {
         const r = await api('/api/providers/test', { method: 'POST', body: JSON.stringify({ id: p.id }) });
-        alert(r.ok ? `✓ ${p.name} reachable (HTTP ${r.status})` : `✕ ${p.name} not reachable: ${r.error ? (r.error.friendly || r.error) : 'HTTP ' + r.status}`);
+        const keyInfo = r.keys && r.keys.length ? '\n' + r.keys.map((k) => `  ${k.masked}: HTTP ${k.status}${k.pruned ? ' (pruned — invalid)' : ''}`).join('\n') : '';
+        alert(r.ok ? `✓ ${p.name} reachable (HTTP ${r.status})${keyInfo}` : `✕ ${p.name} not reachable: ${r.error ? (r.error.friendly || r.error) : 'HTTP ' + r.status}${keyInfo}`);
       } catch (e) {
         alert(`✕ Test failed: ${e.message}`);
       }
       loadProviders();
     };
     providerList.appendChild(el);
+    // Per-key management for pooled credentials
+    if (p.keysMasked && p.keysMasked.length > 1) {
+      for (let i = 0; i < p.keysMasked.length; i++) {
+        const keyRow = document.createElement('div');
+        keyRow.className = 'key-row';
+        keyRow.innerHTML = `<span class="small muted">🔑 ${esc(p.keysMasked[i])}</span>`;
+        const remove = document.createElement('button');
+        remove.className = 'btn btn-subtle';
+        remove.textContent = 'Remove';
+        remove.onclick = async (ev) => {
+          ev.stopPropagation();
+          if (!confirm(`Remove credential ${p.keysMasked[i]} from ${p.name}? It will be deleted from the local store.`)) return;
+          try {
+            await api('/api/providers/keys/remove', { method: 'POST', body: JSON.stringify({ id: p.id, index: i }) });
+            loadProviders();
+          } catch (e) { alert('Remove failed: ' + e.message); }
+        };
+        keyRow.appendChild(remove);
+        providerList.appendChild(keyRow);
+      }
+    }
   }
 }
 
@@ -403,6 +425,14 @@ async function loadTasks() {
           await api('/api/tasks/cancel', { method: 'POST', body: JSON.stringify({ id: t.id }) });
           loadTasks();
         }
+      } else if (t.status === 'blocked' && confirm(`Resume task "${t.title}" from its checkpoint?`)) {
+        const { resumePayload } = await api('/api/tasks/resume', { method: 'POST', body: JSON.stringify({ id: t.id }) });
+        await api('/api/agent/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task: resumePayload.task, mode: resumePayload.mode, resumeTaskId: t.id }),
+        });
+        loadTasks();
       } else if (confirm(`Retry task "${t.title}"?`)) {
         await api('/api/tasks/retry', { method: 'POST', body: JSON.stringify({ id: t.id }) });
         loadTasks();

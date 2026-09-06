@@ -682,3 +682,6 @@ select:hover { border-color: var(--accent); }
   font-size: 11px; color: var(--accent);
   font-family: var(--mono);
 }
+
+.key-row { display: flex; align-items: center; justify-content: space-between; padding: 2px 8px 2px 14px; font-family: var(--mono); }
+.key-row .btn-subtle { padding: 2px 8px; font-size: 11px; }

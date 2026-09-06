@@ -48,6 +48,7 @@ async function runDebugLoop({
   runTestsFn = null, // injectable test runner for the evaluator (defaults to real runTests)
   retryPolicy = null, // bounded same-provider retry policy from the Settings Center
   ctxExtras = null, // runtime settings passed to tool execution (terminal limits…)
+  advisories = null, // caller advisories (resume context) — merged with knowledge
 }) {
   const timeline = [];
   const emit = (state, message) => {
@@ -73,7 +74,7 @@ async function runDebugLoop({
 
   // Failure Knowledge Base: recall prior episodes for this error/task so the
   // investigation does not repeat known-failed fixes.
-  const knowledgeAdvisories = [];
+  const knowledgeAdvisories = [...(advisories || [])];
   if (knowledge) {
     try {
       const prior = knowledge.search(projectRoot, task);
