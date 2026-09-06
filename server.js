@@ -745,16 +745,20 @@ const routes = {
         return;
       }
       res.write(`data: ${JSON.stringify({ type: 'activity', ...event })}\n\n`);
-      // Task Center lifecycle: keep the task record's status in sync with the
-      // workflow state the agent actually emits.
-      const stateToStatus = { APPROVAL: 'waiting_approval', TEST: 'testing', FIX: 'debugging' };
-      const status = stateToStatus[event.state];
-      if (status) {
-        try {
-          tasks.update(record.id, { status });
-        } catch {
-          /* lifecycle sync is best-effort */
-        }
+      // Task Center lifecycle: canonical activity events drive both the task
+      // status and the panel's live label (PART C).
+      const stateToStatus = {
+        waiting_approval: 'waiting_approval', running_test: 'testing',
+        editing: 'debugging', running_command: 'running', provider_request: 'running',
+        thinking: 'running', reading: 'running', searching: 'running', planning: 'running',
+        git_running: 'running', browser_running: 'running', retrying: 'running',
+      };
+      const patch = { lastActivity: { state: event.state, label: event.label || event.message, ts: event.ts, agent: event.agent || null, tool: event.tool || null } };
+      if (stateToStatus[event.state]) patch.status = stateToStatus[event.state];
+      try {
+        tasks.update(record.id, patch);
+      } catch {
+        /* lifecycle sync is best-effort */
       }
     };
 

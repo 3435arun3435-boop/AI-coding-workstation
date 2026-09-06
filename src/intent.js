@@ -28,7 +28,7 @@ const TOOL_CHAT_PATTERNS = [
 ];
 
 const TASK_PATTERNS = [
-  /\b(fix|repair|patch|implement|add|create|write|build|refactor|update|change|modify|delete|remove|migrate|optimize)\b[^.?!]*\b(code|function|bug|test|tests|feature|endpoint|module|file|class|api|component)\b/i,
+  /\b(fix|repair|patch|implement|add|create|write|build|refactor|update|change|modify|delete|remove|migrate|optimize)\b[^.?!]*\b(code|function|bug|test|tests|feature|endpoint|module|file|class|api|component|button|page|panel|dialog|menu|form|input|layout|style|screen|view|settings|ui)\b/i,
   /\b(failing|broken) tests?\b/i,
   /\bmake (it|the) (work|pass)\b/i,
 ];
@@ -41,12 +41,17 @@ const CHAT_PATTERNS = [
  * Classify the execution intent for a task.
  * @returns {{ intent: 'chat'|'tool-chat'|'task', reason: string }}
  */
+const MODIFY_VERB = /\b(fix|repair|patch|implement|add|create|write|build|refactor|update|change|modify|delete|remove|migrate|optimize)\b/i;
+
 function classifyIntent(task) {
   const t = String(task || '');
 
   for (const re of TASK_PATTERNS) {
     if (re.test(t)) return { intent: 'task', reason: `engineering verbs detected (${re})` };
   }
+  // A modification verb with an unrecognized object is still engineering
+  // work — the safer interpretation for a coding workstation.
+  if (MODIFY_VERB.test(t)) return { intent: 'task', reason: 'modification verb present' };
   for (const re of TOOL_CHAT_PATTERNS) {
     if (re.test(t)) return { intent: 'tool-chat', reason: `explicit inspection targets detected` };
   }

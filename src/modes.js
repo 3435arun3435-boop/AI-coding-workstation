@@ -15,6 +15,8 @@
  * resolution failure defaults to 'code'.
  */
 
+const { classifyIntent } = require('./intent');
+
 const READ_ONLY_TOOLS = [
   'run_tests',
   'list_files',
@@ -106,7 +108,9 @@ function resolveAutoMode(task) {
   if (/(^|\b)(review|code review|audit)\b/.test(t)) return 'review';
   if (/(^|\b)(debug|fix|broken|fails?|failing|error|crash|bug|regression)\b/.test(t)) return 'debug';
   if (/(^|\b)(test|tests|testing|unit test|coverage)\b/.test(t)) return 'test';
-  if (/(^|\b)(explain|what is|what does|how does|why|describe|document)\b/.test(t)) return 'ask';
+  // Intent routing (PART A) last: pure conversational/report requests are
+  // ASK — but only after debug/test/review signals, which are more specific.
+  if (classifyIntent(task).intent === 'chat') return 'ask';
   return 'code';
 }
 
